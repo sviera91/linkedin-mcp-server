@@ -195,6 +195,154 @@ server.tool(
   }
 );
 
+server.tool(
+  "linkedin_reshare_post",
+  "Reshare an existing LinkedIn post with optional commentary.",
+  {
+    postUrn: z.string().min(1).describe("The post URN, such as urn:li:share:123."),
+    commentary: z.string().max(3000).default("").describe("Optional commentary."),
+    confirm: z.boolean().describe("Must be true to publish the reshare.")
+  },
+  async ({ postUrn, commentary, confirm }) => {
+    requireConfirmation(confirm);
+    const author = await getMemberUrn();
+    return jsonResult(await createPost({
+      author,
+      commentary,
+      visibility: "PUBLIC",
+      distribution: {
+        feedDistribution: "MAIN_FEED",
+        targetEntities: [],
+        thirdPartyDistributionChannels: []
+      },
+      lifecycleState: "PUBLISHED",
+      isReshareDisabledByAuthor: false,
+      reshareContext: { parent: postUrn }
+    }));
+  }
+);
+
+server.tool(
+  "linkedin_create_comment",
+  "Create a comment on a LinkedIn post.",
+  {
+    postUrn: z.string().min(1).describe("The post URN to comment on."),
+    commentary: z.string().min(1).max(1250).describe("The comment text."),
+    confirm: z.boolean().describe("Must be true to publish the comment.")
+  },
+  async ({ postUrn, commentary, confirm }) => {
+    requireConfirmation(confirm);
+    const response = await linkedinRequest(
+      `/rest/socialActions/${encodeURIComponent(postUrn)}/comments`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          actor: await getMemberUrn(),
+          object: postUrn,
+          message: { text: commentary }
+        })
+      }
+    );
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_react_to_post",
+  "Add a reaction to a LinkedIn post.",
+  {
+    postUrn: z.string().min(1).describe("The post URN to react to."),
+    reactionType: z.enum(["LIKE", "PRAISE", "EMPATHY", "INTEREST", "APPRECIATION", "ENTERTAINMENT"])
+      .default("LIKE"),
+    confirm: z.boolean().describe("Must be true to add the reaction.")
+  },
+  async ({ postUrn, reactionType, confirm }) => {
+    requireConfirmation(confirm);
+    const response = await linkedinRequest(
+      `/rest/reactions?actor=${encodeURIComponent(await getMemberUrn())}`,
+      {
+        method: "POST",
+        body: JSON.stringify({ root: postUrn, reactionType })
+      }
+    );
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_remove_reaction",
+  "Remove your reaction from a LinkedIn post.",
+  {
+    postUrn: z.string().min(1).describe("The post URN."),
+    confirm: z.boolean().describe("Must be true to remove the reaction.")
+  },
+  async ({ postUrn, confirm }) => {
+    requireConfirmation(confirm);
+    const reactionUrn = `urn:li:reaction:(${await getMemberUrn()},${postUrn})`;
+    const response = await linkedinRequest(`/rest/reactions/${encodeURIComponent(reactionUrn)}`, {
+      method: "DELETE"
+    });
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_delete_post",
+  "Delete one of your LinkedIn posts.",
+  {
+    postUrn: z.string().min(1).describe("The URN of your post."),
+    confirm: z.boolean().describe("Must be true to permanently delete the post.")
+  },
+  async ({ postUrn, confirm }) => {
+    requireConfirmation(confirm);
+    const response = await linkedinRequest(`/rest/posts/${encodeURIComponent(postUrn)}`, {
+      method: "DELETE"
+    });
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_edit_comment",
+  "Edit one of your comments on a LinkedIn post.",
+  {
+    postUrn: z.string().min(1).describe("The post URN containing the comment."),
+    commentId: z.string().min(1).describe("The LinkedIn comment ID."),
+    commentary: z.string().min(1).max(1250).describe("The replacement comment text."),
+    confirm: z.boolean().describe("Must be true to modify the comment.")
+  },
+  async ({ postUrn, commentId, commentary, confirm }) => {
+    requireConfirmation(confirm);
+    const response = await linkedinRequest(
+      `/rest/socialActions/${encodeURIComponent(postUrn)}/comments/${encodeURIComponent(commentId)}`,
+      {
+        method: "POST",
+        headers: { "X-RestLi-Method": "PARTIAL_UPDATE" },
+        body: JSON.stringify({ patch: { message: { $set: { text: commentary } } } })
+      }
+    );
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_delete_comment",
+  "Delete one of your comments from a LinkedIn post.",
+  {
+    postUrn: z.string().min(1).describe("The post URN containing the comment."),
+    commentId: z.string().min(1).describe("The LinkedIn comment ID."),
+    confirm: z.boolean().describe("Must be true to permanently delete the comment.")
+  },
+  async ({ postUrn, commentId, confirm }) => {
+    requireConfirmation(confirm);
+    const response = await linkedinRequest(
+      `/rest/socialActions/${encodeURIComponent(postUrn)}/comments/${encodeURIComponent(commentId)}`,
+      { method: "DELETE" }
+    );
+    return jsonResult(response);
+  }
+);
+
 async function startCallbackServer(callback: URL): Promise<void> {
   if (oauthServer) {
     return;
@@ -250,6 +398,28 @@ async function startCallbackServer(callback: URL): Promise<void> {
     oauthServer?.once("error", reject);
     oauthServer?.listen(Number(callback.port || 80), callback.hostname);
   });
+}
+
+async function getMemberUrn(): Promise<string> {
+  const profile = await linkedinRequest("/v2/userinfo");
+  const profileJson = await profile.json() as { sub?: string };
+  if (!profileJson.sub) {
+    throw new Error("LinkedIn did not return the authenticated member identifier.");
+  }
+  return `urn:li:person:${profileJson.sub}`;
+}
+
+async function createPost(body: Record<string, unknown>): Promise<Response> {
+  return linkedinRequest("/rest/posts", {
+    method: "POST",
+    body: JSON.stringify(body)
+  });
+}
+
+function requireConfirmation(confirm: boolean): void {
+  if (!confirm) {
+    throw new Error("This LinkedIn action requires confirm=true.");
+  }
 }
 
 async function linkedinRequest(path: string, init: RequestInit = {}): Promise<Response> {
