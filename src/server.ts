@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, extname } from "node:path";
 import { URL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -127,6 +127,74 @@ server.tool(
   }
 );
 
+server.tool(
+  "linkedin_create_post_with_image",
+  "Upload a local image and publish it with a text post to the authenticated member's LinkedIn profile.",
+  {
+    commentary: z.string().min(1).max(3000).describe("The post text to publish."),
+    imagePath: z.string().min(1).describe("Absolute path to a local JPEG, PNG, GIF, or WebP image."),
+    confirm: z.boolean().describe("Must be true to upload and publish the post.")
+  },
+  async ({ commentary, imagePath, confirm }) => {
+    if (!confirm) {
+      throw new Error("Publishing requires confirm=true.");
+    }
+
+    const profile = await linkedinRequest("/v2/userinfo");
+    const profileJson = await profile.json() as { sub?: string };
+    if (!profileJson.sub) {
+      throw new Error("LinkedIn did not return the authenticated member identifier.");
+    }
+
+    const image = await readFile(imagePath);
+    const contentType = imageContentType(imagePath);
+    const initializeResponse = await linkedinRequest("/rest/images?action=initializeUpload", {
+      method: "POST",
+      body: JSON.stringify({
+        initializeUploadRequest: {
+          owner: `urn:li:person:${profileJson.sub}`
+        }
+      })
+    });
+    const initializeJson = await initializeResponse.json() as {
+      value?: { uploadUrl?: string; image?: string };
+    };
+    const uploadUrl = initializeJson.value?.uploadUrl;
+    const imageUrn = initializeJson.value?.image;
+    if (!uploadUrl || !imageUrn) {
+      throw new Error("LinkedIn did not return an image upload URL and image URN.");
+    }
+
+    const uploadResponse = await fetch(uploadUrl, {
+      method: "PUT",
+      headers: { "Content-Type": contentType },
+      body: image
+    });
+    if (!uploadResponse.ok) {
+      throw new Error(`LinkedIn image upload failed (${uploadResponse.status}).`);
+    }
+
+    const postResponse = await linkedinRequest("/rest/posts", {
+      method: "POST",
+      body: JSON.stringify({
+        author: `urn:li:person:${profileJson.sub}`,
+        commentary,
+        visibility: "PUBLIC",
+        distribution: {
+          feedDistribution: "MAIN_FEED",
+          targetEntities: [],
+          thirdPartyDistributionChannels: []
+        },
+        content: { media: { id: imageUrn } },
+        lifecycleState: "PUBLISHED",
+        isReshareDisabledByAuthor: false
+      })
+    });
+
+    return jsonResult(postResponse);
+  }
+);
+
 async function startCallbackServer(callback: URL): Promise<void> {
   if (oauthServer) {
     return;
@@ -238,6 +306,21 @@ function requiredEnv(name: string): string {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function imageContentType(imagePath: string): string {
+  const contentTypes: Record<string, string> = {
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp"
+  };
+  const contentType = contentTypes[extname(imagePath).toLowerCase()];
+  if (!contentType) {
+    throw new Error("Unsupported image type. Use JPEG, PNG, GIF, or WebP.");
+  }
+  return contentType;
 }
 
 function isNotFound(error: unknown): boolean {

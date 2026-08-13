@@ -14,6 +14,7 @@ The server exposes these MCP tools:
 | `linkedin_auth_status` | Checks whether a local LinkedIn access token is available. |
 | `linkedin_get_my_profile` | Reads the authenticated member's OpenID profile and email. |
 | `linkedin_create_post` | Publishes a text post to the authenticated member's LinkedIn profile. Publishing requires `confirm=true`. |
+| `linkedin_create_post_with_image` | Uploads a local image and publishes it with a text post. Publishing requires `confirm=true`. |
 
 The server uses LinkedIn's official APIs only. It does not scrape LinkedIn,
 use browser cookies, search arbitrary people, read messages, or export
@@ -132,7 +133,8 @@ committing credentials to a configuration file.
 3. Open the returned LinkedIn authorization URL.
 4. Approve access.
 5. Call `linkedin_auth_status`.
-6. Call `linkedin_get_my_profile` or `linkedin_create_post`.
+6. Call `linkedin_get_my_profile`, `linkedin_create_post`, or
+   `linkedin_create_post_with_image` with an absolute local image path.
 
 Example post arguments:
 
