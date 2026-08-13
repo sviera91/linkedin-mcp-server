@@ -1,0 +1,247 @@
+import { createServer, type Server } from "node:http";
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
+import { dirname } from "node:path";
+import { URL } from "node:url";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+
+const clientId = requiredEnv("LINKEDIN_CLIENT_ID");
+const clientSecret = requiredEnv("LINKEDIN_CLIENT_SECRET");
+const redirectUri = process.env.LINKEDIN_REDIRECT_URI ?? "http://127.0.0.1:3000/oauth/callback";
+const linkedinVersion = process.env.LINKEDIN_VERSION ?? "202607";
+const tokenFile = process.env.LINKEDIN_TOKEN_FILE ?? ".data/linkedin-token.json";
+const scopes = ["openid", "profile", "email", "w_member_social"];
+
+type Token = {
+  access_token: string;
+  expires_in: number;
+  created_at: number;
+  refresh_token?: string;
+};
+
+let oauthServer: Server | undefined;
+let pendingState: string | undefined;
+
+const server = new McpServer({
+  name: "linkedin",
+  version: "0.1.0"
+});
+
+server.tool(
+  "linkedin_authenticate",
+  "Start LinkedIn OAuth sign-in. Open the returned URL in a browser, approve access, then call linkedin_auth_status.",
+  {},
+  async () => {
+    const callback = new URL(redirectUri);
+    if (callback.hostname !== "127.0.0.1" && callback.hostname !== "localhost") {
+      throw new Error("Local authentication requires LINKEDIN_REDIRECT_URI to use localhost or 127.0.0.1.");
+    }
+
+    pendingState = randomBytes(24).toString("hex");
+    await startCallbackServer(callback);
+
+    const authorizationUrl = new URL("https://www.linkedin.com/oauth/v2/authorization");
+    authorizationUrl.search = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state: pendingState,
+      scope: scopes.join(" ")
+    }).toString();
+
+    return {
+      content: [{
+        type: "text",
+        text: `Open this URL to authorize LinkedIn:\n${authorizationUrl}\n\nAfter approval, call linkedin_auth_status.`
+      }]
+    };
+  }
+);
+
+server.tool(
+  "linkedin_auth_status",
+  "Check whether LinkedIn OAuth has completed and the local token is available.",
+  {},
+  async () => {
+    const token = await readToken();
+    return {
+      content: [{
+        type: "text",
+        text: token
+          ? "LinkedIn is connected. The local access token is available."
+          : pendingState
+            ? "Authorization is pending. Open the URL returned by linkedin_authenticate."
+            : "LinkedIn is not connected. Call linkedin_authenticate first."
+      }]
+    };
+  }
+);
+
+server.tool(
+  "linkedin_get_my_profile",
+  "Read the authenticated LinkedIn member's OpenID profile and email.",
+  {},
+  async () => {
+    const response = await linkedinRequest("/v2/userinfo");
+    return jsonResult(response);
+  }
+);
+
+server.tool(
+  "linkedin_create_post",
+  "Publish a text post to the authenticated member's LinkedIn profile.",
+  {
+    commentary: z.string().min(1).max(3000).describe("The post text to publish."),
+    confirm: z.boolean().describe("Must be true to publish the post.")
+  },
+  async ({ commentary, confirm }) => {
+    if (!confirm) {
+      throw new Error("Publishing requires confirm=true.");
+    }
+
+    const profile = await linkedinRequest("/v2/userinfo");
+    const profileJson = await profile.json() as { sub?: string };
+    if (!profileJson.sub) {
+      throw new Error("LinkedIn did not return the authenticated member identifier.");
+    }
+
+    const response = await linkedinRequest("/rest/posts", {
+      method: "POST",
+      body: JSON.stringify({
+        author: `urn:li:person:${profileJson.sub}`,
+        commentary,
+        visibility: "PUBLIC",
+        distribution: {
+          feedDistribution: "MAIN_FEED",
+          targetEntities: [],
+          thirdPartyDistributionChannels: []
+        },
+        lifecycleState: "PUBLISHED",
+        isReshareDisabledByAuthor: false
+      })
+    });
+
+    return jsonResult(response);
+  }
+);
+
+async function startCallbackServer(callback: URL): Promise<void> {
+  if (oauthServer) {
+    return;
+  }
+
+  oauthServer = createServer(async (request, response) => {
+    try {
+      const requestUrl = new URL(request.url ?? "/", redirectUri);
+      if (requestUrl.pathname !== callback.pathname) {
+        response.writeHead(404).end("Not found");
+        return;
+      }
+
+      const returnedState = requestUrl.searchParams.get("state");
+      const code = requestUrl.searchParams.get("code");
+      const error = requestUrl.searchParams.get("error");
+      if (error) {
+        response.writeHead(400).end(`LinkedIn authorization failed: ${error}`);
+        return;
+      }
+      if (!code || !pendingState || returnedState !== pendingState) {
+        response.writeHead(400).end("Invalid OAuth callback.");
+        return;
+      }
+
+      const tokenResponse = await fetch("https://www.linkedin.com/oauth/v2/accessToken", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          redirect_uri: redirectUri,
+          client_id: clientId,
+          client_secret: clientSecret
+        })
+      });
+      if (!tokenResponse.ok) {
+        throw new Error(`LinkedIn token exchange failed (${tokenResponse.status}).`);
+      }
+
+      const token = await tokenResponse.json() as Omit<Token, "created_at">;
+      await saveToken({ ...token, created_at: Date.now() });
+      pendingState = undefined;
+      response.writeHead(200, { "Content-Type": "text/html" })
+        .end("<h1>LinkedIn connected</h1><p>You can close this window and return to Copilot.</p>");
+    } catch (error) {
+      response.writeHead(500).end(error instanceof Error ? error.message : "OAuth callback failed.");
+    }
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    oauthServer?.once("listening", () => resolve());
+    oauthServer?.once("error", reject);
+    oauthServer?.listen(Number(callback.port || 80), callback.hostname);
+  });
+}
+
+async function linkedinRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  const token = await readToken();
+  if (!token) {
+    throw new Error("LinkedIn is not connected. Call linkedin_authenticate first.");
+  }
+  if (Date.now() >= token.created_at + token.expires_in * 1000) {
+    throw new Error("The LinkedIn access token has expired. Re-authenticate with linkedin_authenticate.");
+  }
+
+  const headers = new Headers(init.headers);
+  headers.set("Authorization", `Bearer ${token.access_token}`);
+  headers.set("X-Restli-Protocol-Version", "2.0.0");
+  if (path.startsWith("/rest/")) {
+    headers.set("Linkedin-Version", linkedinVersion);
+    headers.set("Content-Type", "application/json");
+  }
+
+  const response = await fetch(`https://api.linkedin.com${path}`, { ...init, headers });
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`LinkedIn API request failed (${response.status}): ${details}`);
+  }
+  return response;
+}
+
+async function readToken(): Promise<Token | undefined> {
+  try {
+    return JSON.parse(await readFile(tokenFile, "utf8")) as Token;
+  } catch (error) {
+    if (isNotFound(error)) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function saveToken(token: Token): Promise<void> {
+  await mkdir(dirname(tokenFile), { recursive: true });
+  await writeFile(tokenFile, JSON.stringify(token, null, 2), { mode: 0o600 });
+  await chmod(tokenFile, 0o600);
+}
+
+function jsonResult(response: Response): Promise<{ content: [{ type: "text"; text: string }] }> {
+  return response.json().then((value) => ({
+    content: [{ type: "text", text: JSON.stringify(value, null, 2) }]
+  }));
+}
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+function isNotFound(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+await server.connect(new StdioServerTransport());
