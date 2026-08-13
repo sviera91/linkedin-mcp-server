@@ -15,13 +15,13 @@ The server exposes these MCP tools:
 | `linkedin_get_my_profile` | Reads the authenticated member's OpenID profile and email. |
 | `linkedin_create_post` | Publishes a text post to the authenticated member's LinkedIn profile. Publishing requires `confirm=true`. |
 | `linkedin_create_post_with_image` | Uploads a local image and publishes it with a text post. Publishing requires `confirm=true`. |
-| `linkedin_reshare_post` | Reshares an existing post with optional commentary. |
-| `linkedin_create_comment` | Creates a comment on a post. |
-| `linkedin_react_to_post` | Adds a reaction such as Like, Celebrate, or Insightful. |
-| `linkedin_remove_reaction` | Removes your reaction from a post. |
-| `linkedin_edit_comment` | Edits one of your comments. |
-| `linkedin_delete_comment` | Deletes one of your comments. |
-| `linkedin_delete_post` | Deletes one of your posts. |
+| `linkedin_reshare_post` | Reshares an existing post with optional commentary. Requires `confirm=true`. |
+| `linkedin_create_comment` | Creates a comment on a post. Requires `confirm=true`. |
+| `linkedin_react_to_post` | Adds a reaction such as Like, Praise, Empathy, Interest, Appreciation, or Entertainment. Requires `confirm=true`. |
+| `linkedin_remove_reaction` | Removes your reaction from a post. Requires `confirm=true`. |
+| `linkedin_edit_comment` | Edits one of your comments. Requires `confirm=true`. |
+| `linkedin_delete_comment` | Deletes one of your comments. Requires `confirm=true`. |
+| `linkedin_delete_post` | Deletes one of your posts. Requires `confirm=true`. |
 
 The server uses LinkedIn's official APIs only. It does not scrape LinkedIn,
 use browser cookies, search arbitrary people, read messages, or export
@@ -142,7 +142,8 @@ committing credentials to a configuration file.
 5. Call `linkedin_auth_status`.
 6. Call any of the tools above. Mutating tools require `confirm=true`.
 
-Example post arguments:
+Mutating tools require explicit confirmation to reduce accidental publishing or
+deletion. Example arguments:
 
 ```json
 {
@@ -150,6 +151,29 @@ Example post arguments:
   "confirm": true
 }
 ```
+
+For social actions, provide the LinkedIn post URN returned by LinkedIn or a
+previous API response:
+
+```json
+{
+  "postUrn": "urn:li:share:123456789",
+  "commentary": "Thanks for sharing this.",
+  "confirm": true
+}
+```
+
+The comment, reaction, reshare, edit, and delete tools operate on the specific
+post or comment identified by their URN/ID. They do not search LinkedIn or read
+your feed. The current default OAuth scopes support identity and member social
+actions, but do not provide general post-history, comment-history, messaging,
+people-search, or connections-read access.
+
+LinkedIn controls access to individual API products and may change endpoint
+requirements. If a social-action call returns an authorization or scope error,
+check the app's enabled products and the permissions currently granted to the
+token; some newer feed APIs may require a feed-specific permission that is not
+included in the default `w_member_social` scope.
 
 ## Troubleshooting
 
